@@ -1,16 +1,16 @@
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using ThirdStart.Models;
 
 namespace ThirdStart.Data
 {
     /// <summary>
-    /// Repository class for managing tasks in the database.
+    /// Repository class for managing tasks stored in a CSV file.
     /// </summary>
     public class TaskRepository
     {
         private bool _hasBeenInitialized = false;
         private readonly ILogger _logger;
+        private const string Header = "ID,Title,IsCompleted";
 
         /// <summary>
         /// Initializes a new instance of the <see cref="TaskRepository"/> class.
@@ -22,195 +22,193 @@ namespace ThirdStart.Data
         }
 
         /// <summary>
-        /// Initializes the database connection and creates the Task table if it does not exist.
+        /// Ensures the CSV file exists, copying the bundled seed file from app package if available.
         /// </summary>
         private async Task Init()
         {
             if (_hasBeenInitialized)
                 return;
 
-            await using var connection = new SqliteConnection(Constants.DatabasePath);
-            await connection.OpenAsync();
-
             try
             {
-                var createTableCmd = connection.CreateCommand();
-                createTableCmd.CommandText = @"
-            CREATE TABLE IF NOT EXISTS Task (
-                ID INTEGER PRIMARY KEY AUTOINCREMENT,
-                Title TEXT NOT NULL,
-                IsCompleted INTEGER NOT NULL,
-                ProjectID INTEGER NOT NULL
-            );";
-                await createTableCmd.ExecuteNonQueryAsync();
+                var masterList = Constants.MasterListPath;
+                if (!File.Exists(masterList))
+                {
+                    // Use a bundled Resources/Raw/tasks.csv seed file if present
+                    if (await FileSystem.AppPackageFileExistsAsync(Constants.SeedDataFileName))
+                    {
+                        await using var assetStream = await FileSystem.OpenAppPackageFileAsync(Constants.SeedDataFileName);
+                        await using var destStream = File.Create(masterList);
+                        await assetStream.CopyToAsync(destStream);
+                    }
+                    else
+                    {
+                        // Create an empty CSV with just the header
+                        await File.WriteAllTextAsync(masterList, Header + Environment.NewLine);
+                    }
+                }
+
+                _hasBeenInitialized = true;
             }
             catch (Exception e)
             {
-                _logger.LogError(e, "Error creating Task table");
+                _logger.LogError(e, "Error initializing tasks CSV");
                 throw;
             }
-
-            _hasBeenInitialized = true;
         }
 
         /// <summary>
-        /// Retrieves a list of all tasks from the database.
+        /// Reads all tasks from the CSV file.
         /// </summary>
-        /// <returns>A list of <see cref="ProjectTask"/> objects.</returns>
+        private async Task<List<ProjectTask>> ReadAllAsync()
+        {
+            var tasks = new List<ProjectTask>();
+            var lines = await File.ReadAllLinesAsync(Constants.MasterListPath);
+
+            foreach (var line in lines.Skip(1)) // Skip header row
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                var parts = ParseCsvLine(line);
+                //make sure we have at least as many parts as we expect in the headerto avoid index out of range errors
+                if (parts.Length < Header.Split(',').Length) continue;
+
+                tasks.Add(new ProjectTask
+                {
+                    ID = int.Parse(parts[0]),
+                    Title = parts[1],
+                    IsCompleted = bool.Parse(parts[2])
+                });
+            }
+
+            return tasks;
+        }
+
+        /// <summary>
+        /// Writes all tasks back to the CSV file.
+        /// </summary>
+        private async Task WriteAllAsync(List<ProjectTask> tasks)
+        {
+            var lines = tasks
+                .Select(t => $"{t.ID},{EscapeCsvField(t.Title)},{t.IsCompleted}")
+                .Prepend(Header);
+
+            await File.WriteAllLinesAsync(Constants.MasterListPath, lines);
+        }
+
+        // Wraps fields containing commas or quotes in double-quotes
+        private static string EscapeCsvField(string field)
+        {
+            if (field.Contains(',') || field.Contains('"') || field.Contains('\n'))
+                return $"\"{field.Replace("\"", "\"\"")}\"";
+            return field;
+        }
+
+        // Basic CSV line parser that handles quoted fields
+        private static string[] ParseCsvLine(string line)
+        {
+            var result = new List<string>();
+            var current = new System.Text.StringBuilder();
+            bool inQuotes = false;
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (inQuotes)
+                {
+                    if (c == '"' && i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        current.Append('"');
+                        i++; // skip escaped quote
+                    }
+                    else if (c == '"')
+                    {
+                        inQuotes = false;
+                    }
+                    else
+                    {
+                        current.Append(c);
+                    }
+                }
+                else
+                {
+                    if (c == '"') inQuotes = true;
+                    else if (c == ',')
+                    {
+                        result.Add(current.ToString());
+                        current.Clear();
+                    }
+                    else current.Append(c);
+                }
+            }
+
+            result.Add(current.ToString());
+            return [.. result];
+        }
+
+        /// <summary>
+        /// Retrieves a list of all tasks from the CSV.
+        /// </summary>
         public async Task<List<ProjectTask>> ListAsync()
         {
             await Init();
-            await using var connection = new SqliteConnection(Constants.DatabasePath);
-            await connection.OpenAsync();
-
-            var selectCmd = connection.CreateCommand();
-            selectCmd.CommandText = "SELECT * FROM Task";
-            var tasks = new List<ProjectTask>();
-
-            await using var reader = await selectCmd.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                tasks.Add(new ProjectTask
-                {
-                    ID = reader.GetInt32(0),
-                    Title = reader.GetString(1),
-                    IsCompleted = reader.GetBoolean(2),
-                    ProjectID = reader.GetInt32(3)
-                });
-            }
-
-            return tasks;
+            return await ReadAllAsync();
         }
 
-        /// <summary>
-        /// Retrieves a list of tasks associated with a specific project.
-        /// </summary>
-        /// <param name="projectId">The ID of the project.</param>
-        /// <returns>A list of <see cref="ProjectTask"/> objects.</returns>
-        public async Task<List<ProjectTask>> ListAsync(int projectId)
-        {
-            await Init();
-            await using var connection = new SqliteConnection(Constants.DatabasePath);
-            await connection.OpenAsync();
-
-            var selectCmd = connection.CreateCommand();
-            selectCmd.CommandText = "SELECT * FROM Task WHERE ProjectID = @projectId";
-            selectCmd.Parameters.AddWithValue("@projectId", projectId);
-            var tasks = new List<ProjectTask>();
-
-            await using var reader = await selectCmd.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                tasks.Add(new ProjectTask
-                {
-                    ID = reader.GetInt32(0),
-                    Title = reader.GetString(1),
-                    IsCompleted = reader.GetBoolean(2),
-                    ProjectID = reader.GetInt32(3)
-                });
-            }
-
-            return tasks;
-        }
 
         /// <summary>
         /// Retrieves a specific task by its ID.
         /// </summary>
-        /// <param name="id">The ID of the task.</param>
-        /// <returns>A <see cref="ProjectTask"/> object if found; otherwise, null.</returns>
         public async Task<ProjectTask?> GetAsync(int id)
         {
             await Init();
-            await using var connection = new SqliteConnection(Constants.DatabasePath);
-            await connection.OpenAsync();
-
-            var selectCmd = connection.CreateCommand();
-            selectCmd.CommandText = "SELECT * FROM Task WHERE ID = @id";
-            selectCmd.Parameters.AddWithValue("@id", id);
-
-            await using var reader = await selectCmd.ExecuteReaderAsync();
-            if (await reader.ReadAsync())
-            {
-                return new ProjectTask
-                {
-                    ID = reader.GetInt32(0),
-                    Title = reader.GetString(1),
-                    IsCompleted = reader.GetBoolean(2),
-                    ProjectID = reader.GetInt32(3)
-                };
-            }
-
-            return null;
+            var tasks = await ReadAllAsync();
+            return tasks.FirstOrDefault(t => t.ID == id);
         }
 
         /// <summary>
-        /// Saves a task to the database. If the task ID is 0, a new task is created; otherwise, the existing task is updated.
+        /// Saves a task. Inserts if ID is 0, otherwise updates the existing record.
         /// </summary>
-        /// <param name="item">The task to save.</param>
-        /// <returns>The ID of the saved task.</returns>
         public async Task<int> SaveItemAsync(ProjectTask item)
         {
             await Init();
-            await using var connection = new SqliteConnection(Constants.DatabasePath);
-            await connection.OpenAsync();
+            var tasks = await ReadAllAsync();
 
-            var saveCmd = connection.CreateCommand();
             if (item.ID == 0)
             {
-                saveCmd.CommandText = @"
-            INSERT INTO Task (Title, IsCompleted, ProjectID) VALUES (@title, @isCompleted, @projectId);
-            SELECT last_insert_rowid();";
+                item.ID = tasks.Count > 0 ? tasks.Max(t => t.ID) + 1 : 1;
+                tasks.Add(item);
             }
             else
             {
-                saveCmd.CommandText = @"
-            UPDATE Task SET Title = @title, IsCompleted = @isCompleted, ProjectID = @projectId WHERE ID = @id";
-                saveCmd.Parameters.AddWithValue("@id", item.ID);
+                var index = tasks.FindIndex(t => t.ID == item.ID);
+                if (index >= 0)
+                    tasks[index] = item;
             }
 
-            saveCmd.Parameters.AddWithValue("@title", item.Title);
-            saveCmd.Parameters.AddWithValue("@isCompleted", item.IsCompleted);
-            saveCmd.Parameters.AddWithValue("@projectId", item.ProjectID);
-
-            var result = await saveCmd.ExecuteScalarAsync();
-            if (item.ID == 0)
-            {
-                item.ID = Convert.ToInt32(result);
-            }
-
+            await WriteAllAsync(tasks);
             return item.ID;
         }
 
         /// <summary>
-        /// Deletes a task from the database.
+        /// Deletes a task from the CSV.
         /// </summary>
-        /// <param name="item">The task to delete.</param>
-        /// <returns>The number of rows affected.</returns>
+        /// <returns>The number of rows removed.</returns>
         public async Task<int> DeleteItemAsync(ProjectTask item)
         {
             await Init();
-            await using var connection = new SqliteConnection(Constants.DatabasePath);
-            await connection.OpenAsync();
-
-            var deleteCmd = connection.CreateCommand();
-            deleteCmd.CommandText = "DELETE FROM Task WHERE ID = @id";
-            deleteCmd.Parameters.AddWithValue("@id", item.ID);
-
-            return await deleteCmd.ExecuteNonQueryAsync();
+            var tasks = await ReadAllAsync();
+            var removed = tasks.RemoveAll(t => t.ID == item.ID);
+            await WriteAllAsync(tasks);
+            return removed;
         }
 
         /// <summary>
-        /// Drops the Task table from the database.
+        /// Clears all tasks from the CSV, leaving only the header row.
         /// </summary>
         public async Task DropTableAsync()
         {
-            await Init();
-            await using var connection = new SqliteConnection(Constants.DatabasePath);
-            await connection.OpenAsync();
-
-            var dropTableCmd = connection.CreateCommand();
-            dropTableCmd.CommandText = "DROP TABLE IF EXISTS Task";
-            await dropTableCmd.ExecuteNonQueryAsync();
+            await File.WriteAllTextAsync(Constants.MasterListPath, Header + Environment.NewLine);
             _hasBeenInitialized = false;
         }
     }
